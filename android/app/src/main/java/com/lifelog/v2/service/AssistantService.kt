@@ -11,6 +11,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.media.AudioFormat
 import android.media.AudioRecord
+import android.media.MediaPlayer
 import android.media.MediaRecorder
 import android.os.Build
 import android.os.IBinder
@@ -24,8 +25,17 @@ import com.k2fsa.sherpa.onnx.KeywordSpotterConfig
 import com.k2fsa.sherpa.onnx.OnlineModelConfig
 import com.k2fsa.sherpa.onnx.OnlineStream
 import com.k2fsa.sherpa.onnx.OnlineTransducerModelConfig
+import com.lifelog.v2.data.OrchestratorApi
+import com.lifelog.v2.data.SettingsRepository
 import com.lifelog.v2.presentation.main.MainActivity
 import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
+import java.io.ByteArrayOutputStream
+import java.io.File
+import java.io.FileOutputStream
+import javax.inject.Inject
 
 @AndroidEntryPoint
 class AssistantService : Service() {
@@ -36,14 +46,22 @@ class AssistantService : Service() {
         const val ACTION_START = "com.lifelog.v2.action.START"
         const val ACTION_STOP = "com.lifelog.v2.action.STOP"
         const val ACTION_WAKE_DETECTED = "com.lifelog.v2.action.WAKE_DETECTED"
+        const val ACTION_VOICE_RESULT = "com.lifelog.v2.action.VOICE_RESULT"
         const val EXTRA_KEYWORD = "keyword"
+        const val EXTRA_TRANSCRIPT = "transcript"
+        const val EXTRA_REPLY = "reply"
 
         private const val TAG = "AssistantService"
         private const val SAMPLE_RATE = 16000
         private const val MODEL_DIR = "sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01"
+        private const val RECORD_DURATION_MS = 10000
     }
 
+    @Inject lateinit var orchestratorApi: OrchestratorApi
+    @Inject lateinit var settingsRepository: SettingsRepository
+
     @Volatile private var isRunning = false
+    @Volatile private var isProcessingVoice = false
     private var audioRecord: AudioRecord? = null
     private var recordingThread: Thread? = null
     private var kws: KeywordSpotter? = null
@@ -94,7 +112,7 @@ class AssistantService : Service() {
             initAudioRecord()
             isRunning = true
 
-            updateNotification("Listening — say \"Hey Assistant\"")
+            updateNotification("Listening — say \"Hello World\"")
 
             recordingThread = Thread {
                 processAudioLoop()
@@ -132,11 +150,9 @@ class AssistantService : Service() {
             config = config,
         )
 
-        // Create stream with no custom keywords - uses keywordsFile from config
         val stream = kws!!.createStream()
         if (stream.ptr == 0L) {
             Log.e(TAG, "Failed to create KWS stream - trying with keyword string")
-            // Fallback: pass raw keyword text
             val fallback = kws!!.createStream("HELLO WORLD / HEY SIRI / HI GOOGLE")
             if (fallback.ptr == 0L) {
                 Log.e(TAG, "Fallback stream also failed, cannot start")
@@ -148,7 +164,6 @@ class AssistantService : Service() {
             kwsStream = stream
         }
         Log.i(TAG, "KWS stream created, ptr=${kwsStream!!.ptr}")
-
         Log.i(TAG, "Keyword spotter initialized successfully")
     }
 
@@ -197,6 +212,9 @@ class AssistantService : Service() {
             val stream = kwsStream ?: break
             val spotter = kws ?: break
 
+            // Skip KWS processing while handling a voice command
+            if (isProcessingVoice) continue
+
             stream.acceptWaveform(samples, sampleRate = SAMPLE_RATE)
 
             // Log every 50th loop (~5 seconds)
@@ -216,19 +234,14 @@ class AssistantService : Service() {
                     // Reset stream for next detection
                     spotter.reset(stream)
 
-                    // Notify UI
+                    // Notify UI of wake word
                     sendBroadcast(Intent(ACTION_WAKE_DETECTED).apply {
                         setPackage(packageName)
                         putExtra(EXTRA_KEYWORD, keyword)
                     })
 
-                    updateNotification("Wake word detected: \"$keyword\" — Listening...")
-
-                    // Reset notification after 3 seconds
-                    Thread.sleep(3000)
-                    if (isRunning) {
-                        updateNotification("Listening — say \"Hey Assistant\"")
-                    }
+                    // Run full voice pipeline
+                    handleVoiceCommand()
                 }
             }
         }
@@ -236,25 +249,149 @@ class AssistantService : Service() {
         Log.i(TAG, "Audio processing loop exited")
     }
 
+    private fun handleVoiceCommand() {
+        if (isProcessingVoice) return
+        isProcessingVoice = true
+
+        Thread {
+            try {
+                // 1. Stop KWS audio source, record command
+                updateNotification("Listening for command...")
+
+                // Record audio for the command
+                val pcm = recordCommand(RECORD_DURATION_MS)
+                Log.i(TAG, "Recorded ${pcm.size} bytes of command audio")
+
+                // 2. Send to voice pipeline (STT → LLM → TTS)
+                updateNotification("Processing...")
+                val voiceResult = runBlocking { orchestratorApi.voice(pcm, SAMPLE_RATE) }
+
+                voiceResult.onSuccess { vr ->
+                    Log.i(TAG, "Voice result: '${vr.transcript}' → '${vr.reply}'")
+
+                    // Notify UI with transcript and reply
+                    sendBroadcast(Intent(ACTION_VOICE_RESULT).apply {
+                        setPackage(packageName)
+                        putExtra(EXTRA_TRANSCRIPT, vr.transcript)
+                        putExtra(EXTRA_REPLY, vr.reply)
+                    })
+
+                    // 3. Play TTS audio if available
+                    if (vr.audio != null && vr.audio.isNotEmpty()) {
+                        updateNotification("Speaking...")
+                        playAudio(vr.audio)
+                    }
+
+                    updateNotification("Listening — say \"Hello World\"")
+                }.onFailure { e ->
+                    Log.e(TAG, "Voice command failed", e)
+                    updateNotification("Error: ${e.message}")
+                    Thread.sleep(2000)
+                    updateNotification("Listening — say \"Hello World\"")
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "handleVoiceCommand error", e)
+                updateNotification("Error: ${e.message}")
+            } finally {
+                isProcessingVoice = false
+            }
+        }.start()
+    }
+
+    private fun recordCommand(maxDurationMs: Int): ByteArray {
+        val totalSamples = SAMPLE_RATE * maxDurationMs / 1000
+        val minBuf = AudioRecord.getMinBufferSize(
+            SAMPLE_RATE,
+            AudioFormat.CHANNEL_IN_MONO,
+            AudioFormat.ENCODING_PCM_16BIT
+        )
+        val buffer = ShortArray(minBuf)
+        val result = ByteArrayOutputStream()
+
+        // Use a fresh AudioRecord for the command
+        val recorder = AudioRecord(
+            MediaRecorder.AudioSource.VOICE_RECOGNITION,
+            SAMPLE_RATE,
+            AudioFormat.CHANNEL_IN_MONO,
+            AudioFormat.ENCODING_PCM_16BIT,
+            minBuf * 2
+        )
+        recorder.startRecording()
+
+        // VAD: detect silence after speech
+        val energyThreshold = 0.01f  // speech energy threshold
+        val silenceChunksToStop = 10  // ~1 second of silence = stop (10 x 100ms)
+        var hasSpeech = false
+        var silenceCount = 0
+        var totalRead = 0
+
+        while (totalRead < totalSamples) {
+            val read = recorder.read(buffer, 0, minOf(buffer.size, totalSamples - totalRead))
+            if (read <= 0) break
+            for (i in 0 until read) {
+                result.write(buffer[i].toInt() and 0xFF)
+                result.write((buffer[i].toInt() shr 8) and 0xFF)
+            }
+            totalRead += read
+
+            // Simple energy-based VAD
+            val energy = FloatArray(read) { abs(buffer[it].toFloat() / 32768.0f) }.average()
+            if (energy > energyThreshold) {
+                hasSpeech = true
+                silenceCount = 0
+            } else if (hasSpeech) {
+                silenceCount++
+                if (silenceCount >= silenceChunksToStop) {
+                    Log.i(TAG, "VAD: silence detected after speech, stopping recording")
+                    break
+                }
+            }
+        }
+
+        recorder.stop()
+        recorder.release()
+
+        Log.i(TAG, "VAD: recorded ${totalRead} samples (${totalRead * 1000 / SAMPLE_RATE}ms)")
+        return result.toByteArray()
+    }
+
+    private fun playAudio(mp3Bytes: ByteArray) {
+        try {
+            // Write MP3 to temp file and play with MediaPlayer
+            val tempFile = File(cacheDir, "tts_response.mp3")
+            FileOutputStream(tempFile).use { it.write(mp3Bytes) }
+
+            val mediaPlayer = MediaPlayer()
+            mediaPlayer.setDataSource(tempFile.absolutePath)
+            mediaPlayer.prepare()
+            mediaPlayer.setOnCompletionListener {
+                it.release()
+                tempFile.delete()
+            }
+            mediaPlayer.start()
+            Log.i(TAG, "Playing TTS audio (${mp3Bytes.size} bytes)")
+
+            // Block until playback finishes
+            while (mediaPlayer.isPlaying) {
+                Thread.sleep(100)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Audio playback failed", e)
+        }
+    }
+
     private fun stopDetection() {
         isRunning = false
         recordingThread?.interrupt()
         recordingThread = null
 
-        try {
-            audioRecord?.stop()
-            audioRecord?.release()
-        } catch (_: Exception) {}
+        try { audioRecord?.stop(); audioRecord?.release() } catch (_: Exception) {}
         audioRecord = null
 
-        try {
-            kwsStream?.release()
-        } catch (_: Exception) {}
+        try { kwsStream?.release() } catch (_: Exception) {}
         kwsStream = null
 
-        try {
-            kws?.release()
-        } catch (_: Exception) {}
+        try { kws?.release() } catch (_: Exception) {}
         kws = null
 
         Log.i(TAG, "Detection stopped")

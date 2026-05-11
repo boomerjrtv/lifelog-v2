@@ -101,14 +101,23 @@ class MainActivity : ComponentActivity() {
 
     private val wakeReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
-            if (intent?.action == AssistantService.ACTION_WAKE_DETECTED) {
-                wakeKeyword.value = intent.getStringExtra(AssistantService.EXTRA_KEYWORD) ?: ""
+            when (intent?.action) {
+                AssistantService.ACTION_WAKE_DETECTED -> {
+                    wakeKeyword.value = intent.getStringExtra(AssistantService.EXTRA_KEYWORD) ?: ""
+                }
+                AssistantService.ACTION_VOICE_RESULT -> {
+                    // Clear wake indicator, show transcript/reply in chat
+                    wakeKeyword.value = ""
+                }
             }
         }
     }
 
     private fun registerWakeReceiver() {
-        val filter = IntentFilter(AssistantService.ACTION_WAKE_DETECTED)
+        val filter = IntentFilter().apply {
+            addAction(AssistantService.ACTION_WAKE_DETECTED)
+            addAction(AssistantService.ACTION_VOICE_RESULT)
+        }
         ContextCompat.registerReceiver(this, wakeReceiver, filter, ContextCompat.RECEIVER_EXPORTED)
     }
 

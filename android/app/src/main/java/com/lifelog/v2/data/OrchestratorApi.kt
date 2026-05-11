@@ -129,6 +129,51 @@ class OrchestratorApi(
         }
     }
 
+    data class VoiceResult(val transcript: String, val reply: String, val audio: ByteArray?)
+
+    suspend fun voice(pcm16: ByteArray, sampleRate: Int = 16000): Result<VoiceResult> = withContext(Dispatchers.IO) {
+        try {
+            val wav = pcm16ToWav(pcm16, sampleRate)
+            val wavBody = wav.toRequestBody("audio/wav".toMediaType())
+            val multipart = MultipartBody.Builder()
+                .setType(MultipartBody.FORM)
+                .addFormDataPart("audio", "audio.wav", wavBody)
+                .build()
+
+            val request = Request.Builder()
+                .url("$baseUrl/voice")
+                .post(multipart)
+                .apply { if (apiKey.isNotBlank()) addHeader("X-API-Key", apiKey) }
+                .build()
+
+            val response = client.newCall(request).execute()
+
+            if (response.isSuccessful) {
+                val contentType = response.header("Content-Type", "")
+                if (contentType?.contains("audio") == true) {
+                    val audio = response.body?.bytes()
+                    val transcript = response.header("X-Transcript", "") ?: ""
+                    val reply = response.header("X-Reply", "") ?: ""
+                    Log.i(TAG, "Voice result: transcript='$transcript', reply='$reply', audio=${audio?.size} bytes")
+                    Result.success(VoiceResult(transcript, reply, audio))
+                } else {
+                    val responseBody = response.body?.string() ?: ""
+                    val json = JSONObject(responseBody)
+                    val transcript = json.optString("transcript", "")
+                    val reply = json.optString("text", "")
+                    Result.success(VoiceResult(transcript, reply, null))
+                }
+            } else {
+                val errBody = response.body?.string() ?: ""
+                Log.e(TAG, "Voice error: ${response.code} $errBody")
+                Result.failure(Exception("Voice error: ${response.code}"))
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Voice failed", e)
+            Result.failure(e)
+        }
+    }
+
     private fun pcm16ToWav(pcm: ByteArray, sampleRate: Int): ByteArray {
         val channels = 1
         val bitsPerSample = 16

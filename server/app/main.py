@@ -54,6 +54,16 @@ async def health() -> dict:
     return {"status": "ok"}
 
 
+@app.post("/tts")
+async def text_to_speech(text: str = "Hello world"):
+    """Synthesize text to speech."""
+    audio_bytes = await _tts_synthesize(text)
+    if audio_bytes:
+        from fastapi.responses import Response
+        return Response(content=audio_bytes, media_type="audio/mpeg")
+    return {"error": "TTS failed", "text": text}
+
+
 # ── STT (Slice 3) ──────────────────────────────────────────────────────────
 
 @app.post("/stt")
@@ -125,7 +135,7 @@ async def chat(req: ChatRequest):
         from fastapi.responses import Response
         return Response(
             content=audio_bytes,
-            media_type="audio/wav",
+            media_type="audio/mpeg",
             headers={"X-Transcript": llm_reply[:500].encode("utf-8").decode("latin-1", errors="replace")}
         )
     else:
@@ -141,7 +151,7 @@ async def chat_text_only(req: ChatRequest):
 
 async def _llm_respond(text: str, system_prompt: str = "") -> str:
     """Query LM Studio for LLM response."""
-    sys = system_prompt or "You are a helpful voice assistant. Keep responses concise and conversational — they will be spoken aloud."
+    sys = system_prompt or "You are a helpful voice assistant for a smart home device. Rules: 1) Keep responses under 2 sentences. 2) NEVER use emojis, emoticons, or special unicode characters. 3) Use only plain English words and basic punctuation. 4) If you would normally use an emoji, use words instead (e.g. say 'that is great' not '😊')."
 
     # Auto-detect first available chat model
     model_name = "google/gemma-4-e4b"
@@ -173,7 +183,10 @@ async def _llm_respond(text: str, system_prompt: str = "") -> str:
             if resp.status_code == 200:
                 data = resp.json()
                 reply = data["choices"][0]["message"]["content"].strip()
-                return reply
+                # Strip any remaining emojis/special chars for TTS
+                import re
+                reply = re.sub(r'[\U0001F600-\U0001F64F\U0001F300-\U0001F5FF\U0001F680-\U0001F6FF\U0001F1E0-\U0001F1FF\U00002702-\U000027B0\U0000FE00-\U0000FEFF\U0001F900-\U0001F9FF\U00002600-\U000026FF\U0000200D\u200D\uFE0F]', '', reply)
+                return reply.strip()
             else:
                 logger.error(f"LM Studio error: {resp.status_code} {resp.text}")
                 return f"[LLM error: {resp.status_code}]"
@@ -183,19 +196,23 @@ async def _llm_respond(text: str, system_prompt: str = "") -> str:
 
 
 async def _tts_synthesize(text: str) -> bytes | None:
-    """Synthesize text to WAV audio via Piper."""
+    """Synthesize text to WAV audio via edge-tts."""
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post(
-                "http://localhost:5000/api/tts",
-                json={"text": text[:1000]},
-            )
-            if resp.status_code == 200:
-                return resp.content
+        import edge_tts
+        communicate = edge_tts.Communicate(text, "en-US-AriaNeural")
+        # edge-tts outputs MP3, write to temp file then return bytes
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+            tmp_path = f.name
+        import asyncio
+        loop = asyncio.get_event_loop()
+        await communicate.save(tmp_path)
+        audio = open(tmp_path, "rb").read()
+        os.unlink(tmp_path)
+        logger.info(f"TTS: synthesized {len(audio)} bytes MP3")
+        return audio
     except Exception as e:
-        logger.warning(f"Piper unavailable: {e}")
-
-    return None
+        logger.error(f"TTS failed: {e}")
+        return None
 
 
 # ── Voice (full loop, Slice 5) ─────────────────────────────────────────────
@@ -228,7 +245,7 @@ async def voice(audio: UploadFile = File(...)):
         from fastapi.responses import Response
         return Response(
             content=audio_bytes,
-            media_type="audio/wav",
+            media_type="audio/mpeg",
             headers={
                 "X-Transcript": transcript[:300].encode("utf-8").decode("latin-1", errors="replace"),
                 "X-Reply": llm_reply[:500].encode("utf-8").decode("latin-1", errors="replace"),
