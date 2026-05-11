@@ -30,9 +30,9 @@ class SettingsRepository @Inject constructor(
 
     var apiKey: String
         get() = prefs.getString("api_key", "") ?: ""
-        set(value) = prefs.edit().putString("api_key", value).apply()
+        set(value) { prefs.edit().putString("api_key", value).apply() }
 
     var isConfigured: Boolean
         get() = serverUrl.isNotBlank()
-        private set(_) = prefs.edit().apply {}
+        private set(_) { prefs.edit().apply {} }
 }

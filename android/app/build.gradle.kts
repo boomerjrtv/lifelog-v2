@@ -1,6 +1,7 @@
 plugins {
     id("com.android.application") version "8.7.3"
     id("org.jetbrains.kotlin.android") version "2.0.21"
+    id("org.jetbrains.kotlin.plugin.compose") version "2.0.21"
     id("com.google.devtools.ksp") version "2.0.21-1.0.28"
     id("com.google.dagger.hilt.android") version "2.53.1"
 }
@@ -44,9 +45,7 @@ android {
         buildConfig = true
     }
 
-    composeOptions {
-        kotlinCompilerExtensionVersion = "1.5.15"
-    }
+    // No composeOptions needed — kotlin plugin.compose handles it
 }
 
 dependencies {

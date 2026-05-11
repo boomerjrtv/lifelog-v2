@@ -6,7 +6,9 @@ import com.lifelog.v2.data.SettingsRepository
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import android.util.Log
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import javax.inject.Inject
@@ -16,6 +18,10 @@ class SetupViewModel @Inject constructor(
     private val settingsRepository: SettingsRepository,
     private val client: OkHttpClient
 ) : ViewModel() {
+
+    companion object {
+        private const val TAG = "SetupViewModel"
+    }
 
     val serverUrl = MutableStateFlow(settingsRepository.serverUrl)
     val apiKey = MutableStateFlow(settingsRepository.apiKey)
@@ -38,15 +44,19 @@ class SetupViewModel @Inject constructor(
         }
 
         _connectionState.value = ConnectionState.Connecting
-        viewModelScope.launch {
+        viewModelScope.launch(Dispatchers.IO) {
             try {
+                val fullUrl = "$url/health"
+                Log.i(TAG, "Connecting to: $fullUrl")
+
                 val request = Request.Builder()
-                    .url("$url/health")
+                    .url(fullUrl)
                     .get()
                     .build()
 
                 val response = client.newCall(request).execute()
                 val body = response.body?.string()
+                Log.i(TAG, "Response: code=${response.code} body=$body")
 
                 if (response.isSuccessful && body?.contains("\"status\"") == true) {
                     settingsRepository.serverUrl = url
@@ -58,6 +68,7 @@ class SetupViewModel @Inject constructor(
                     )
                 }
             } catch (e: Exception) {
+                Log.e(TAG, "Connection failed", e)
                 _connectionState.value = ConnectionState.Error(
                     e.message ?: "Connection failed"
                 )
