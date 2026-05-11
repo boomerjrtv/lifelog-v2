@@ -1,5 +1,6 @@
 package com.lifelog.v2.di
 
+import com.lifelog.v2.data.OrchestratorApi
 import com.lifelog.v2.data.SettingsRepository
 import dagger.Module
 import dagger.Provides
@@ -21,4 +22,11 @@ object NetworkModule {
             .readTimeout(30, TimeUnit.SECONDS)
             .writeTimeout(30, TimeUnit.SECONDS)
             .build()
+
+    @Provides
+    @Singleton
+    fun provideOrchestratorApi(
+        client: OkHttpClient,
+        settingsRepository: SettingsRepository
+    ): OrchestratorApi = OrchestratorApi(client, settingsRepository)
 }
