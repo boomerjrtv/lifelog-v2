@@ -1,0 +1,15 @@
+# Android
+*.iml
+.gradle/
+local.properties
+.idea/
+build/
+captures/
+*.apk
+*.aab
+
+# Server
+__pycache__/
+*.pyc
+.env
+.venv/
