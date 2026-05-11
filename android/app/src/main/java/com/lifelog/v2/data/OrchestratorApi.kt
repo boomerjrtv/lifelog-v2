@@ -59,6 +59,38 @@ class OrchestratorApi(
 
     suspend fun chat(text: String): Result<String> = withContext(Dispatchers.IO) {
         try {
+            // Try search-enabled chat first, fall back to regular chat
+            val jsonBody = JSONObject().apply {
+                put("text", text)
+            }
+            val body = jsonBody.toString().toRequestBody("application/json".toMediaType())
+
+            val request = Request.Builder()
+                .url("$baseUrl/chat/search")
+                .post(body)
+                .apply { if (apiKey.isNotBlank()) addHeader("X-API-Key", apiKey) }
+                .build()
+
+            val response = client.newCall(request).execute()
+            val responseBody = response.body?.string() ?: ""
+
+            if (response.isSuccessful) {
+                val json = JSONObject(responseBody)
+                val reply = json.getString("text")
+                Log.i(TAG, "Chat reply: $reply")
+                Result.success(reply)
+            } else {
+                // Fallback to regular chat
+                chatFallback(text)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Search chat failed, trying regular chat", e)
+            chatFallback(text)
+        }
+    }
+
+    private suspend fun chatFallback(text: String): Result<String> = withContext(Dispatchers.IO) {
+        try {
             val jsonBody = JSONObject().apply {
                 put("text", text)
                 put("session_id", "phone_session")
@@ -77,14 +109,11 @@ class OrchestratorApi(
             if (response.isSuccessful) {
                 val json = JSONObject(responseBody)
                 val reply = json.getString("text")
-                Log.i(TAG, "Chat reply: $reply")
                 Result.success(reply)
             } else {
-                Log.e(TAG, "Chat error: ${response.code}")
                 Result.failure(Exception("Chat error: ${response.code}"))
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Chat failed", e)
             Result.failure(e)
         }
     }
